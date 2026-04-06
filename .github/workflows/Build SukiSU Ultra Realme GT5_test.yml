@@ -773,7 +773,171 @@ jobs:
               patch -p1 < No_5uS.patch || true
             fi    
           fi
-
+      - name: Modify Battery Voltage Settings
+        run: |
+          cd kernel_workspace/kernel_platform
+          
+          # ========== 配置区域：修改这里的电压值 ==========
+          # 单位：微伏 (uV)    例如：4350000 = 4.35V
+          FULL_VOLTAGE=4350000      # 满电电压（默认通常 4400000 = 4.4V）
+          EMPTY_VOLTAGE=3000000     # 空电/关机电压（默认通常 3200000 = 3.2V）
+          SHUTDOWN_VOLTAGE=2900000  # 强制关机电压
+          # ================================================
+          
+          echo "=========================================="
+          echo "目标电压设置："
+          echo "  满电电压: ${FULL_VOLTAGE}uV ($(echo "scale=2; $FULL_VOLTAGE/1000000" | bc)V)"
+          echo "  空电电压: ${EMPTY_VOLTAGE}uV ($(echo "scale=2; $EMPTY_VOLTAGE/1000000" | bc)V)"
+          echo "  关机电压: ${SHUTDOWN_VOLTAGE}uV ($(echo "scale=2; $SHUTDOWN_VOLTAGE/1000000" | bc)V)"
+          echo "=========================================="
+          
+          # 定义修改函数
+          modify_voltage_in_file() {
+            local file="$1"
+            local desc="$2"
+            
+            if [ ! -f "$file" ]; then
+              return 1
+            fi
+            
+            # 创建备份
+            cp "$file" "${file}.volt_bak"
+            
+            # 执行多种模式的替换（适配不同命名风格）
+            # 满电电压
+            sed -i "s/batt_full_uv[[:space:]]*=[[:space:]]*[0-9]*/batt_full_uv = $FULL_VOLTAGE/g" "$file"
+            sed -i "s/vbatt_full[[:space:]]*=[[:space:]]*[0-9]*/vbatt_full = $FULL_VOLTAGE/g" "$file"
+            sed -i "s/4400000/$FULL_VOLTAGE/g" "$file"  # 常见默认值 4.4V
+            sed -i "s/4350000/$FULL_VOLTAGE/g" "$file"  # 常见默认值 4.35V
+            
+            # 空电/关机电压
+            sed -i "s/batt_empty_uv[[:space:]]*=[[:space:]]*[0-9]*/batt_empty_uv = $EMPTY_VOLTAGE/g" "$file"
+            sed -i "s/shutdown_voltage[[:space:]]*=[[:space:]]*[0-9]*/shutdown_voltage = $SHUTDOWN_VOLTAGE/g" "$file"
+            sed -i "s/vbatt_empty[[:space:]]*=[[:space:]]*[0-9]*/vbatt_empty = $EMPTY_VOLTAGE/g" "$file"
+            sed -i "s/3200000/$EMPTY_VOLTAGE/g" "$file"  # 常见默认值 3.2V
+            sed -i "s/3100000/$SHUTDOWN_VOLTAGE/g" "$file"  # 常见默认值 3.1V
+            
+            # 检查是否有修改
+            if ! diff -q "$file" "${file}.volt_bak" >/dev/null 2>&1; then
+              echo "✅ 已修改 $desc: $file"
+              # 显示修改内容
+              diff "${file}.volt_bak" "$file" | head -20
+              return 0
+            else
+              rm "${file}.volt_bak"
+              return 1
+            fi
+          }
+          
+          # ========== 1. 修改 C 驱动文件 ==========
+          echo ""
+          echo "[1/3] 搜索并修改 C 驱动文件..."
+          
+          # 常见的高通充电/电量计驱动路径
+          DRIVER_PATHS=(
+            "./common/drivers/power/supply/qcom"
+            "./$KERNEL_REPOS/drivers/power/supply/qcom"
+            "./common/drivers/power"
+            "./$KERNEL_REPOS/drivers/power"
+          )
+          
+          MODIFIED_COUNT=0
+          for path in "${DRIVER_PATHS[@]}"; do
+            if [ -d "$path" ]; then
+              echo "  扫描目录: $path"
+              for file in $(find "$path" -name "*.c" -o -name "*.h" 2>/dev/null); do
+                if modify_voltage_in_file "$file" "驱动文件"; then
+                  ((MODIFIED_COUNT++))
+                fi
+              done
+            fi
+          done
+          
+          if [ $MODIFIED_COUNT -eq 0 ]; then
+            echo "⚠️  未找到可修改的 C 驱动文件，尝试全局搜索..."
+            # 全局搜索关键文件
+            for file in $(find . -path "*/power/*" -name "*.c" | head -20); do
+              if grep -q "batt_full_uv\|vbatt_full\|4400000\|4350000" "$file" 2>/dev/null; then
+                if modify_voltage_in_file "$file" "驱动文件(全局)"; then
+                  ((MODIFIED_COUNT++))
+                fi
+              fi
+            done
+          fi
+          
+          echo "  共修改 $MODIFIED_COUNT 个驱动文件"
+          
+          # ========== 2. 修改设备树 DTS 文件 ==========
+          echo ""
+          echo "[2/3] 搜索并修改设备树文件..."
+          
+          DTS_MODIFIED=0
+          DTS_PATH="./arch/arm64/boot/dts"
+          if [ -d "$DTS_PATH" ]; then
+            # 查找包含电池节点的 DTS 文件
+            for dts in $(find "$DTS_PATH" -name "*.dts*" -exec grep -l "battery\|batt\|qpnp-fg\|smb5" {} \; 2>/dev/null); do
+              echo "  发现电池相关 DTS: $dts"
+              
+              # 创建备份
+              cp "$dts" "${dts}.volt_bak"
+              
+              # 替换设备树中的电压值（格式：<4400000> 或 <0x4330000>）
+              sed -i "s/<4400000>/<$FULL_VOLTAGE>/g" "$dts"
+              sed -i "s/<4350000>/<$FULL_VOLTAGE>/g" "$dts"
+              sed -i "s/<3200000>/<$EMPTY_VOLTAGE>/g" "$dts"
+              sed -i "s/<3100000>/<$SHUTDOWN_VOLTAGE>/g" "$dts"
+              
+              # 替换属性名形式（如 qcom,batt-full-voltage）
+              sed -i "s/qcom,batt-full-voltage[[:space:]]*=[[:space:]]*<[0-9a-fx]*>/qcom,batt-full-voltage = <$FULL_VOLTAGE>/gi" "$dts"
+              sed -i "s/qcom,batt-empty-voltage[[:space:]]*=[[:space:]]*<[0-9a-fx]*>/qcom,batt-empty-voltage = <$EMPTY_VOLTAGE>/gi" "$dts"
+              
+              if ! diff -q "$dts" "${dts}.volt_bak" >/dev/null 2>&1; then
+                echo "✅ 已修改 DTS: $dts"
+                ((DTS_MODIFIED++))
+              else
+                rm "${dts}.volt_bak"
+              fi
+            done
+          fi
+          echo "  共修改 $DTS_MODIFIED 个设备树文件"
+          
+          # ========== 3. 修改配置文件（defconfig） ==========
+          echo ""
+          echo "[3/3] 检查配置文件..."
+          
+          CONFIG_FILE="./common/arch/arm64/configs/gki_defconfig"
+          if [ -f "$CONFIG_FILE" ]; then
+            # 某些电压可能通过 CONFIG 选项控制
+            if grep -q "CONFIG_BATT_" "$CONFIG_FILE" 2>/dev/null; then
+              echo "  发现电池相关 CONFIG，添加自定义电压配置"
+              echo "# Custom Voltage Settings" >> "$CONFIG_FILE"
+              echo "CONFIG_BATT_FULL_VOLTAGE=$FULL_VOLTAGE" >> "$CONFIG_FILE"
+              echo "CONFIG_BATT_EMPTY_VOLTAGE=$EMPTY_VOLTAGE" >> "$CONFIG_FILE"
+            fi
+          fi
+          
+          # ========== 验证修改 ==========
+          echo ""
+          echo "=========================================="
+          echo "修改验证："
+          echo "=========================================="
+          
+          # 搜索修改后的值确认
+          echo "搜索满电电压 $FULL_VOLTAGE:"
+          grep -r "$FULL_VOLTAGE" --include="*.c" --include="*.h" --include="*.dts*" . 2>/dev/null | head -5 || echo "  (可能在宏定义中)"
+          
+          echo ""
+          echo "搜索空电电压 $EMPTY_VOLTAGE:"
+          grep -r "$EMPTY_VOLTAGE" --include="*.c" --include="*.h" --include="*.dts*" . 2>/dev/null | head -5 || echo "  (可能在宏定义中)"
+          
+          echo ""
+          echo "⚠️  重要提示："
+          echo "  1. 请确保电压值在安全范围内（关机电压 ≥ 2.9V，满电电压 ≤ 4.45V）"
+          echo "  2. 过低的关机电压可能导致电池过放损坏"
+          echo "  3. 过高的满电电压可能影响电池寿命"
+          echo "  4. 建议首次刷入后监测电池温度和使用情况"
+          echo "=========================================="
+          
       # OGKI转换GKI，无需修改 dtbo 开机
       - name: Apply Convert HMBIRD_OGKI to HMBIRD_GKI
         if: ${{ fromJSON(env.KV1) >= 6 && fromJSON(env.KV2) >= 66 && github.event.inputs.SCHED_HMBIRD == 'false' }}
